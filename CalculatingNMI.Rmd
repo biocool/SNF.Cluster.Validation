@@ -1,0 +1,657 @@
+---
+title: "NMI calculation"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+---
+#R default expalnations
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+
+#general overview
+In this code I'm gonna calculate the NMI between each measure and the final fused net
+
+#Code
+```{r libs}
+library(corrplot)
+library(caret)
+library(SNFtool)
+library(ggplot2)
+library(factoextra)
+library(effsize)
+library(data.table)
+library(igraph)
+library(ggstatsplot)
+library(sigclust)
+library(dplyr)
+```
+#Function defenition
+```{r Yaqoing_SNF_Louvain_SingleVar}
+# I change the function, to do the clustering based on only one variable
+#INPUT: "dat": data frame including all the features (cols) and subjects (rows); 
+#"clinic_var": a (set of) clinical variable(s) (we must have a column (columns) with the exactly same name(s))
+Yaqoing_SNF_Louvain_SingleVar <- function(dat, clinic_var) {
+  # normalization based on the subset of clinical var
+  clinc_data <- standardNormalization(dat[,clinic_var])
+  
+  # pair-wise distance
+  DistClinic = (dist2(as.matrix(clinc_data),as.matrix(clinc_data)))^(1/2)
+  
+  # add row and column names
+  rownames(DistClinic) <- dat$subj
+  colnames(DistClinic) <- dat$subj
+  
+  # similarity graphs
+  
+  WClinic <- affinityMatrix(DistClinic, K = 20, sigma = 0.5)
+  
+  # fuse/merge two matricies into one similarity network
+  W = SNF(list(WROIs, WClinic), 20, 20)
+  
+  # visualization
+  dat$index[dat$Dx == "ASD"] <- 1
+  dat$index[dat$Dx == "ASDFeat"] <- 2
+  dat$index[dat$Dx == "DD/Other"] <- 3
+  dat$index[dat$Dx == "LD"] <- 4
+  dat$index[dat$Dx == "TD"] <- 5
+  
+  fviz_cluster(object = list(data = W, cluster = dat$index), geom = "point",
+               ellipse = F, show.clust.cent = F, shape = 19,
+               pointsize = 3, ellipse.type = "norm", ggtheme = theme_void())
+  
+  # reorganize similarity network
+  ind <- which(lower.tri(W,diag=F) , arr.ind = TRUE)
+  
+  snf_matrix <- as.data.frame(ind)
+  for (x in 1:dim(ind)[1]) {
+    snf_matrix[x, 3:5] <- cbind(colnames(W)[ind[x, "col"]],
+                                colnames(W)[ind[x, "row"]],
+                                round(W[colnames(W)[ind[x, "col"]],
+                                        colnames(W)[ind[x, "row"]]],5))
+  }
+  colnames(snf_matrix)[3:5] <- c("Source", "Target", "Weight")
+  snf_matrix$name <- paste(as.character(snf_matrix$Source), 
+                           as.character(snf_matrix$Target), sep = ".")
+  
+  # threshold the similarity network
+  snf_matrix_thr <- as.data.frame(matrix(0, 0, 6))
+  for (i in 1:dim(W)[1]) {
+    tmp_weight <- snf_matrix[snf_matrix$col == i, ]
+    top <- tmp_weight[as.numeric(tmp_weight$Weight) > quantile(as.numeric(tmp_weight$Weight), prob = 1 - 15/100),]
+    snf_matrix_thr <- rbind(top, snf_matrix_thr)
+  }
+  
+  dim(snf_matrix_thr)
+  
+  # thresholded matrix
+  
+  matrix_thr <- as.data.frame(matrix(0, nrow(dat), nrow(dat)))
+  rownames(matrix_thr) <- dat$subj
+  colnames(matrix_thr) <- dat$subj
+  
+  for (i in seq_along(snf_matrix_thr$Source)) {
+    matrix_thr[snf_matrix_thr$Source[i], snf_matrix_thr$Target[i]] <- 
+      as.numeric(snf_matrix_thr$Weight[i])
+  }
+  
+  
+  # Louvain clustering analysis
+  gg <- as.matrix(matrix_thr)
+  G1 <- graph_from_adjacency_matrix(gg, mode = "undirected", weighted = T, 
+                                    diag = F)
+  
+  clusterlouvain <- igraph::cluster_louvain(G1)
+  nclust <- max(clusterlouvain$membership)
+  
+  print(paste0("There are ",  nclust, " clusters")) 
+  
+  # clustering results
+  W_Clustering_thr <- as.data.frame(matrix(0, dim(W)[1], 3))
+  colnames(W_Clustering_thr) <- c("subj", "Clustering", "group")
+  
+  W_Clustering_thr$Clustering <- clusterlouvain$membership
+  W_Clustering_thr$subj <- dat$subj
+  W_Clustering_thr$group <- dat$group
+  
+  return(list(snf_matrix_thr = snf_matrix_thr, 
+              W_Clustering_thr = W_Clustering_thr)
+         )
+}
+
+```
+
+```{r SNF_Louvain}
+#I got the below code from Yaqoing 
+# SNF_Louvain.R
+#
+# 1) Perform similarity fusion network analysis with 6 ROI variables (temporal ROI 
+# activation from three language paradigms) and 14 clinical variables; 
+# 2) Run Louvain clustering analysis with the similarity network (strongest 15% 
+# connecting partners of each subject) 
+SNF_Louvain <- function(dat, ROI_var, clinic_var) {
+  # normalization variables for each data type
+  ROI_dat <- standardNormalization(dat[,ROI_var])
+  clinc_data <- standardNormalization(dat[,clinic_var])
+  
+  # pair-wise distance
+  DistROIs = (dist2(as.matrix(ROI_dat),as.matrix(ROI_dat)))^(1/2)
+  DistClinic = (dist2(as.matrix(clinc_data),as.matrix(clinc_data)))^(1/2)
+  
+  # add row and column names
+  rownames(DistROIs) <- dat$subj
+  rownames(DistClinic) <- dat$subj
+  
+  colnames(DistROIs) <- dat$subj
+  colnames(DistClinic) <- dat$subj
+  
+  # similarity graphs
+  WROIs <- affinityMatrix(DistROIs, K = 20, sigma = 0.5)
+  WClinic <- affinityMatrix(DistClinic, K = 20, sigma = 0.5)
+  
+  # fuse/merge two matricies into one similarity network
+  W = SNF(list(WROIs, WClinic), 20, 20)
+  
+  # visualization
+  dat$index[dat$Dx == "ASD"] <- 1
+  dat$index[dat$Dx == "ASDFeat"] <- 2
+  dat$index[dat$Dx == "DD/Other"] <- 3
+  dat$index[dat$Dx == "LD"] <- 4
+  dat$index[dat$Dx == "TD"] <- 5
+  
+  fviz_cluster(object = list(data = W, cluster = dat$index), geom = "point",
+               ellipse = F, show.clust.cent = F, shape = 19,
+               pointsize = 3, ellipse.type = "norm", ggtheme = theme_void())
+  
+  # reorganize similarity network
+  ind <- which(lower.tri(W,diag=F) , arr.ind = TRUE)
+  
+  snf_matrix <- as.data.frame(ind)
+  for (x in 1:dim(ind)[1]) {
+    snf_matrix[x, 3:5] <- cbind(colnames(W)[ind[x, "col"]],
+                                colnames(W)[ind[x, "row"]],
+                                round(W[colnames(W)[ind[x, "col"]],
+                                        colnames(W)[ind[x, "row"]]],5))
+  }
+  colnames(snf_matrix)[3:5] <- c("Source", "Target", "Weight")
+  snf_matrix$name <- paste(as.character(snf_matrix$Source), 
+                           as.character(snf_matrix$Target), sep = ".")
+  
+  # threshold the similarity network
+  snf_matrix_thr <- as.data.frame(matrix(0, 0, 6))
+  for (i in 1:dim(W)[1]) {
+    tmp_weight <- snf_matrix[snf_matrix$col == i, ]
+    top <- tmp_weight[as.numeric(tmp_weight$Weight) > quantile(as.numeric(tmp_weight$Weight), prob = 1 - 15/100),]
+    snf_matrix_thr <- rbind(top, snf_matrix_thr)
+  }
+  
+  dim(snf_matrix_thr)
+  
+  # thresholded matrix
+  
+  matrix_thr <- as.data.frame(matrix(0, nrow(dat), nrow(dat)))
+  rownames(matrix_thr) <- dat$subj
+  colnames(matrix_thr) <- dat$subj
+  
+  for (i in seq_along(snf_matrix_thr$Source)) {
+    matrix_thr[snf_matrix_thr$Source[i], snf_matrix_thr$Target[i]] <- 
+      as.numeric(snf_matrix_thr$Weight[i])
+  }
+  
+  
+  # Louvain clustering analysis
+  gg <- as.matrix(matrix_thr)
+  G1 <- graph_from_adjacency_matrix(gg, mode = "undirected", weighted = T, 
+                                    diag = F)
+  
+  clusterlouvain <- igraph::cluster_louvain(G1)
+  nclust <- max(clusterlouvain$membership)
+  
+  print(paste0("There are ",  nclust, " clusters")) 
+  
+  # clustering results
+  W_Clustering_thr <- as.data.frame(matrix(0, dim(W)[1], 3))
+  colnames(W_Clustering_thr) <- c("subj", "Clustering", "group")
+  
+  W_Clustering_thr$Clustering <- clusterlouvain$membership
+  W_Clustering_thr$subj <- dat$subj
+  W_Clustering_thr$group <- dat$group
+  
+  return(list(snf_matrix_thr, W_Clustering_thr))
+}
+```
+
+
+##reading the data
+```{r}
+yaqoing.input.data  <- 
+  read.csv("./Data/datafile_clusters.csv")
+yaqoing.input.data.intake <- 
+  read.csv("./Data/datafile_clusters_intake.csv")
+
+```
+
+
+
+##using outcome scores
+
+```{r Extracting columns related to ROIs and clinical features }
+ROI_var.Intake <- 
+  colnames(yaqoing.input.data)[c(5:8)]
+clinic_var <- 
+  colnames(yaqoing.input.data)[c(9:14)]
+
+dim(yaqoing.input.data)
+```
+
+```{r SNF Example rankFeaturesByNMI}
+## First, set all the parameters:
+K = 20;		# number of neighbors, usually (10~30)
+alpha = 0.5;  	# hyperparameter, usually (0.3~0.8)
+T = 20; 	# Number of Iterations, usually (10~20)
+
+## Data1 is of size n x d_1, 
+## where n is the number of patients, d_1 is the number of genes, 
+## Data2 is of size n x d_2, 
+## where n is the number of patients, d_2 is the number of methylation
+data(Data1)
+data(Data2)
+
+## Here, the simulation data (SNFdata) has two data types. They are complementary to each other. 
+## And two data types have the same number of points. 
+## The first half data belongs to the first cluster; the rest belongs to the second cluster.
+truelabel = c(matrix(1,100,1),matrix(2,100,1)); ## the ground truth of the simulated data
+
+## Calculate distance matrices
+## (here we calculate Euclidean Distance, you can use other distance, e.g,correlation)
+
+## If the data are all continuous values, we recommend the users to perform 
+## standard normalization before using SNF, 
+## though it is optional depending on the data the users want to use.  
+# Data1 = standardNormalization(Data1);
+# Data2 = standardNormalization(Data2);
+
+
+
+## Calculate the pair-wise distance; 
+## If the data is continuous, we recommend to use the function "dist2" as follows 
+Dist1 = (dist2(as.matrix(Data1),as.matrix(Data1)))^(1/2)
+Dist2 = (dist2(as.matrix(Data2),as.matrix(Data2)))^(1/2)
+
+## next, construct similarity graphs
+W1 = affinityMatrix(Dist1, K, alpha)
+W2 = affinityMatrix(Dist2, K, alpha)
+
+## next, we fuse all the graphs
+## then the overall matrix can be computed by similarity network fusion(SNF):
+W = SNF(list(W1,W2), K, T)
+
+NMI_scores <- rankFeaturesByNMI(list(Data1, Data2), W)
+```
+
+```{r SNF Example concordanceNetworkNMI }
+
+# How to use SNF with multiple views
+
+# Load views into list "dataL"
+data(dataL)
+data(label)
+#View(dataL)
+# Set the other parameters
+K = 20 # number of neighbours
+alpha = 0.5 # hyperparameter in affinityMatrix
+T = 20 # number of iterations of SNF
+# Normalize the features in each of the views.
+#dataL = lapply(dataL, standardNormalization)
+
+# Calculate the distances for each view
+distL = lapply(dataL, function(x) (dist2(x, x)^(1/2)))
+
+# Construct the similarity graphs
+affinityL = lapply(distL, function(x) affinityMatrix(x, K, alpha))
+
+# an example of how to use concordanceNetworkNMI
+Concordance_matrix = concordanceNetworkNMI(affinityL, 3);
+
+## The output, Concordance_matrix,
+## shows the concordance between the fused network and each individual network. 
+#View(dataL)
+
+```
+
+```{r Calculating Clinical Affinity Matrix List}
+yaqoing.clinical.measures.list <- 
+  as.list(yaqoing.input.data[,c(9:14)])
+length(yaqoing.clinical.measures.list)
+
+
+
+# Calculate the distances for each view
+yaqoing.clinical.measures.dist.list <- lapply(yaqoing.clinical.measures.list, function(x) (dist2(as.matrix(x), as.matrix(x))^(1/2)))
+
+# Construct the affinityMatrices (similarity graphs)
+yaqoing.clinical.measures.Aff.Matrix.list <- lapply(yaqoing.clinical.measures.dist.list, function(x) affinityMatrix(x, K = 20, sigma = 0.5))
+
+```
+
+```{r Calculating ROI Affinity Matrix List}
+  #extracting the cols that are correspond to ROIs (fMRI features)
+  ROI_var.Intake <- 
+    colnames(yaqoing.input.data)[c(5:8)]
+  # normalization variables for each data type
+  ROI_dat <- standardNormalization(yaqoing.input.data[,ROI_var.Intake])
+  
+  # pair-wise distance
+  DistROIs = (dist2(as.matrix(ROI_dat),as.matrix(ROI_dat)))^(1/2)
+  
+  # Construct the affinityMatrix (similarity graph)
+  WROIs.Intake <- affinityMatrix(DistROIs, K = 20, sigma = 0.5)
+```
+
+```{r Calculating Affinity Matrix for all features (FusedNet) }
+
+ROI_dat <- standardNormalization(yaqoing.input.data[,ROI_var.Intake])
+  clinc_data <- standardNormalization(yaqoing.input.data[,clinic_var])
+  
+  # pair-wise distance
+  DistROIs = (dist2(as.matrix(ROI_dat),as.matrix(ROI_dat)))^(1/2)
+  DistClinic = (dist2(as.matrix(clinc_data),as.matrix(clinc_data)))^(1/2)
+  
+  # add row and column names
+  rownames(DistROIs) <- yaqoing.input.data$subj
+  rownames(DistClinic) <- yaqoing.input.data$subj
+  
+  colnames(DistROIs) <- yaqoing.input.data$subj
+  colnames(DistClinic) <- yaqoing.input.data$subj
+  
+  # similarity graphs
+  WROIs.Intake <- affinityMatrix(DistROIs, K = 20, sigma = 0.5)
+  WClinic <- affinityMatrix(DistClinic, K = 20, sigma = 0.5)
+  
+  # fuse/merge two matricies into one similarity network
+  fusedAff.Matrix = SNF(list(WROIs.Intake, WClinic), 20, 20)
+dim(fusedAff.Matrix)
+```
+
+
+
+```{r Final concordanceNetworkNMI}
+#merging fusedNet, ROI affinity matrix, and  list of clinical affinity matrices
+yaqoing.clinical.and.ROI.Aff.Matrix.list <- 
+  yaqoing.clinical.measures.Aff.Matrix.list
+
+yaqoing.clinical.and.ROI.Aff.Matrix.list[["fusedAff.Matrix"]] <- 
+  fusedAff.Matrix
+
+yaqoing.clinical.and.ROI.Aff.Matrix.list[["ROI.affinMatrix"]] <- 
+  WROIs.Intake
+
+yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI <- concordanceNetworkNMI(yaqoing.clinical.and.ROI.Aff.Matrix.list, 6)
+
+dim(yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI)
+length(yaqoing.clinical.and.ROI.Aff.Matrix.list)
+
+#assigning the appropriate names to rows and cols of the final matrix
+rownames(yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI) <- 
+  names(yaqoing.clinical.and.ROI.Aff.Matrix.list)
+
+colnames(yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI) <- 
+  names(yaqoing.clinical.and.ROI.Aff.Matrix.list)
+yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI
+#View(yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI)
+```
+
+
+
+##using intake scores
+
+```{r Extracting columns related to ROIs and clinical features intake}
+ROI_var.Intake.Intake <- 
+  colnames(yaqoing.input.data.intake)[c(5:8)]
+clinic_var.Intake <- 
+  colnames(yaqoing.input.data.intake)[c(9:14)]
+```
+
+```{r Calculating Clinical Affinity Matrix List intake}
+yaqoing.clinical.measures.list.intake <- 
+  as.list(yaqoing.input.data.intake[,c(9:14)])
+length(yaqoing.clinical.measures.list.intake)
+
+# Calculate the distances for each view
+yaqoing.clinical.measures.dist.list.intake <- lapply(yaqoing.clinical.measures.list.intake, function(x) (dist2(as.matrix(x), as.matrix(x))^(1/2)))
+
+# Construct the affinityMatrices (similarity graphs)
+yaqoing.clinical.measures.Aff.Matrix.list.intake <- lapply(yaqoing.clinical.measures.dist.list.intake, function(x) affinityMatrix(x, K = 20, sigma = 0.5))
+
+```
+
+```{r Calculating ROI Affinity Matrix List intake}
+  #extracting the cols that are correspond to ROIs (fMRI features)
+  ROI_var.Intake.Intake <- 
+    colnames(yaqoing.input.data.intake)[c(5:8)]
+  # normalization variables for each data type
+  ROI_dat.Intake <- standardNormalization(yaqoing.input.data.intake[,ROI_var.Intake.Intake])
+  
+  # pair-wise distance
+  DistROIs.Intake = (dist2(as.matrix(ROI_dat.Intake),as.matrix(ROI_dat.Intake)))^(1/2)
+  
+  # Construct the affinityMatrix (similarity graph)
+  WROIs.Intake.Intake <- affinityMatrix(DistROIs.Intake, K = 20, sigma = 0.5)
+```
+
+```{r Calculating Affinity Matrix for all features (FusedNet) intake}
+
+  ROI_dat.Intake <- standardNormalization(yaqoing.input.data.intake[,ROI_var.Intake.Intake])
+  clinc_data.Intake <- standardNormalization(yaqoing.input.data.intake[,clinic_var.Intake])
+  
+  # pair-wise distance
+  DistROIs.Intake = (dist2(as.matrix(ROI_dat.Intake),as.matrix(ROI_dat.Intake)))^(1/2)
+  DistClinic.Intake = (dist2(as.matrix(clinc_data.Intake),as.matrix(clinc_data.Intake)))^(1/2)
+  
+  # add row and column names
+  rownames(DistROIs.Intake) <- yaqoing.input.data.intake$subj
+  rownames(DistClinic.Intake) <- yaqoing.input.data.intake$subj
+  
+  colnames(DistROIs.Intake) <- yaqoing.input.data.intake$subj
+  colnames(DistClinic.Intake) <- yaqoing.input.data.intake$subj
+  
+  # similarity graphs
+  WROIs.Intake.Intake <- affinityMatrix(DistROIs.Intake, K = 20, sigma = 0.5)
+  WClinic.Intake <- affinityMatrix(DistClinic.Intake, K = 20, sigma = 0.5)
+  
+  # fuse/merge two matricies into one similarity network
+  fusedAff.Matrix.Intake = SNF(list(WROIs.Intake.Intake, WClinic.Intake), 20, 20)
+dim(fusedAff.Matrix.Intake)
+```
+
+
+
+```{r Final concordanceNetworkNMI intake}
+#merging fusedNet, ROI affinity matrix, and  list of clinical affinity matrices
+yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake <- 
+  yaqoing.clinical.measures.Aff.Matrix.list.intake
+
+yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake[["fusedAff.Matrix.Intake"]] <- 
+  fusedAff.Matrix.Intake
+
+yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake[["ROI.affinMatrix.Intake"]] <- 
+  WROIs.Intake.Intake
+
+#adding fused affinity matrix for outcome scores
+yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake[["fusedAff.Matrix.Outcome"]] <-
+  yaqoing.clinical.and.ROI.Aff.Matrix.list$fusedAff.Matrix
+
+
+
+yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake.concordanceNetworkNMI <- concordanceNetworkNMI(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake, 6)
+
+dim(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake.concordanceNetworkNMI)#9 9
+length(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake)
+
+#assigning the appropriate names to rows and cols of the final matrix
+rownames(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake.concordanceNetworkNMI) <- 
+  names(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake)
+
+colnames(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake.concordanceNetworkNMI) <- 
+  names(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake)
+#View(yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake.concordanceNetworkNMI)
+```
+
+
+#Viz
+```{r Visulizing the NMI matrix}
+
+yaqoing.All.concordanceNetworkNMI.4.Viz <-   yaqoing.clinical.and.ROI.Aff.Matrix.list.concordanceNetworkNMI
+#Assigning new shorter row and col names
+colnames(yaqoing.All.concordanceNetworkNMI.4.Viz) <- 
+  c("CoSo", "RR", "ABC", "RLT", "ELT", "ELC", "Fused", "BrainAct.")
+rownames(yaqoing.All.concordanceNetworkNMI.4.Viz) <- 
+  c("CoSo", "RR", "ABC", "RLT", "ELT", "ELC", "Fused", "BrainAct.")
+
+corrplot.mixed(corr = yaqoing.All.concordanceNetworkNMI.4.Viz, upper = "pie",  tl.cex = 0.8)
+```
+
+
+```{r Visulizing the NMI matrix All Intake and Outcome Fused}
+
+yaqoing.All.concordanceNetworkNMI.4.Viz.Intake.FusedOutcome <-   
+  yaqoing.clinical.and.ROI.Aff.Matrix.list.Intake.concordanceNetworkNMI
+
+#Assigning new shorter row and col names
+colnames(yaqoing.All.concordanceNetworkNMI.4.Viz.Intake.FusedOutcome) <- 
+  c("CoSo", "RR", "ABC", "RLT", "ELT", "ELC", "Fused", "BrainAct.", "Fused2")
+rownames(yaqoing.All.concordanceNetworkNMI.4.Viz.Intake.FusedOutcome) <- 
+  c("CoSo", "RR", "ABC", "RLT", "ELT", "ELC", "Fused", "BrainAct.", "Fused2")
+
+corrplot.mixed(corr = yaqoing.All.concordanceNetworkNMI.4.Viz.Intake.FusedOutcome, upper = "pie",  tl.cex = 0.8)
+```
+
+
+#Calculating p-value for NMI scores
+based on the below code:
+1- calNMI is symetric
+```{r palying with calNMI function}
+rnd.clusterLabel1 <- 
+  c(rep(1,3),rep(2,4),rep(3,3))
+
+rnd.clusterLabel2<- 
+  c(rep(2,3),rep(3,4),rep(1,3))
+
+calNMI(x = rnd.clusterLabel1, y = rnd.clusterLabel1)#1
+calNMI(x = rnd.clusterLabel1, y = rnd.clusterLabel2)#1
+calNMI(x = rnd.clusterLabel2, y = rnd.clusterLabel1)#1
+```
+
+```{r computing NMI for random clustering}
+#labels of the original clustering based on the fused otcome scores
+yaqoing.clustering.labels.outcome.scores <- 
+  yaqoing.input.data$Clustering
+No.of.rnd.clustering <- 10000
+NMI.vctr <- c()
+for (i in c(1:No.of.rnd.clustering)) 
+{
+  #oermuting the labels (using random sampling with the same size)
+  permuted.cluster.labels <- sample(x = yaqoing.clustering.labels.outcome.scores, size = length(yaqoing.clustering.labels.outcome.scores), replace = FALSE)
+  new.NMI <- 
+    calNMI(permuted.cluster.labels, yaqoing.clustering.labels.outcome.scores)
+  NMI.vctr <- 
+    c(NMI.vctr, new.NMI)
+}
+hist(NMI.vctr)
+range(NMI.vctr)#0.01177025 0.10093771
+```
+
+
+#Running sig clust
+
+based on the below results from sigclust 
+both types of p-value are zero:
+pval:
+simulated sigclust p-value based on empiriccal quantiles.
+
+pvalnorm:
+simulated sigclust p-value based on Gaussian quantiles.
+
+
+```{r}
+ #sigclust functions needs the data matrix as the first parameter in which
+ #each row corresponds to a sample and each column to a variable
+ yaqoing.data.4.sigClust <- yaqoing.input.data[,c(5:14)]
+ dim(yaqoing.data.4.sigClust)#176   10
+ yaqoing.data.4.sigClust.standardNormalized <-
+   standardNormalization(yaqoing.data.4.sigClust)
+ #View(yaqoing.data.4.sigClust)
+pvalue.4.plot <-
+   sigclust(yaqoing.data.4.sigClust.standardNormalized, nsim=1000, nrep=100, labflag=1,icovest=icovest, label = yaqoing.input.data$index)
+ plot(pvalue.4.plot)
+#View(pvalue.4.plot)
+```
+
+#Mutation (mapping MIPs data)
+
+```{r reading data}
+MIPs.7.7.2022.Edition.SFARI.Added <- read.csv("/Users/apple/Desktop/Eric/Research/FunctionalGenomics/Alaysis/DownStreamAnalysis/SNP.Variant.Calling/MIPS/MostUpdated7.7.2022/Kendra.Last.Update.All.Details.7.7.2022.Edition.ManuallyCurated.csv")
+dim(MIPs.7.7.2022.Edition.SFARI.Added)
+```
+
+
+```{r Mergeing MIPS data with Yaqoing clustering}
+#adding mips and sfari infor to the clustering
+yaqoing.input.data.MIPS.Added.7.7.2022 <- 
+  merge(x = yaqoing.input.data, 
+        y = MIPs.7.7.2022.Edition.SFARI.Added, 
+        by.x = "subj", by.y = "Sample.ID", all.x = TRUE)
+dim(yaqoing.input.data.MIPS.Added.7.7.2022)#182  48
+
+table(yaqoing.input.data.MIPS.Added.7.7.2022$HaveMIPSData)#172
+table(yaqoing.input.data.MIPS.Added.7.7.2022$HaveMIPS.Mutation)#43
+table(yaqoing.input.data.MIPS.Added.7.7.2022$HaveSFARI.1.2.Mutatoin)#31
+
+table(yaqoing.input.data.MIPS.Added.7.7.2022$HaveMIPSData,
+      yaqoing.input.data.MIPS.Added.7.7.2022$Clustering)
+table(yaqoing.input.data.MIPS.Added.7.7.2022$HaveMIPS.Mutation,
+      yaqoing.input.data.MIPS.Added.7.7.2022$Clustering)
+table(yaqoing.input.data.MIPS.Added.7.7.2022$HaveSFARI.1.2.Mutatoin,
+      yaqoing.input.data.MIPS.Added.7.7.2022$Clustering)
+
+```
+
+```{r Summarizing Mutation Data}
+
+yaqoing.summarized.mutation.data <- 
+  yaqoing.input.data.MIPS.Added.7.7.2022 %>%
+  group_by(Clustering)%>%
+  summarise(
+            ClusterSize = length(Clustering),
+            No.Of.Subjects.HaveHaveMIPSData = sum(na.omit(HaveMIPSData)),
+            No.Of.Subjects.HaveMIPS.Mutation = sum(na.omit(HaveMIPS.Mutation)),
+            No.Of.Subjects.HaveSFARI.1.2.Mutatoin = sum(na.omit(HaveSFARI.1.2.Mutatoin)),
+            Pcnt.With.MIPsData.Mutatoin = No.Of.Subjects.HaveHaveMIPSData/length(Clustering) ,
+            Pcnt.With.HaveMIPS.Mutation = No.Of.Subjects.HaveMIPS.Mutation/length(Clustering) ,
+            Pcnt.With.HaveSFARI.1.2.Mutatoin = No.Of.Subjects.HaveSFARI.1.2.Mutatoin/length(Clustering) ,
+            
+            )
+
+write.csv(yaqoing.summarized.mutation.data, file = "./Result/yaqoing.summarized.mutation.data.csv")
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,283 @@
+---
+title: "Clustering Robustness"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+#Code
+
+##Fuction
+```{r SNF_Louvain}
+#I got the below code from Yaqoing 
+# SNF_Louvain.R
+#I changed the output to be simpler and the function just returens the clustering but not the matrix 
+# 1) Perform similarity fusion network analysis with 6 ROI variables (temporal ROI 
+# activation from three language paradigms) and 14 clinical variables; 
+# 2) Run Louvain clustering analysis with the similarity network (strongest 15% 
+# connecting partners of each subject) 
+SNF_Louvain.Simple.Output <- function(dat, ROI_var, clinic_var) {
+  
+  # normalization variables for each data type
+  ROI_dat <- standardNormalization(dat[,ROI_var])
+  clinc_data <- standardNormalization(dat[,clinic_var])
+  
+  # pair-wise distance
+  DistROIs = (dist2(as.matrix(ROI_dat),as.matrix(ROI_dat)))^(1/2)
+  DistClinic = (dist2(as.matrix(clinc_data),as.matrix(clinc_data)))^(1/2)
+  
+  # add row and column names
+  rownames(DistROIs) <- dat$subj
+  rownames(DistClinic) <- dat$subj
+  
+  colnames(DistROIs) <- dat$subj
+  colnames(DistClinic) <- dat$subj
+  
+  # similarity graphs
+  WROIs <- affinityMatrix(DistROIs, K = 20, sigma = 0.5)
+  WClinic <- affinityMatrix(DistClinic, K = 20, sigma = 0.5)
+  
+  # fuse/merge two matricies into one similarity network
+  W = SNF(list(WROIs, WClinic), 20, 20)
+  
+  # visualization
+  dat$index[dat$Dx == "ASD"] <- 1
+  dat$index[dat$Dx == "ASDFeat"] <- 2
+  dat$index[dat$Dx == "DD/Other"] <- 3
+  dat$index[dat$Dx == "LD"] <- 4
+  dat$index[dat$Dx == "TD"] <- 5
+  
+  fviz_cluster(object = list(data = W, cluster = dat$index), geom = "point",
+               ellipse = FALSE, show.clust.cent = FALSE, shape = 19,
+               pointsize = 3, ellipse.type = "norm", ggtheme = theme_void())
+  
+  # reorganize similarity network
+  ind <- which(lower.tri(W,diag=FALSE) , arr.ind = TRUE)
+  
+  snf_matrix <- as.data.frame(ind)
+  for (x in 1:dim(ind)[1]) {
+    snf_matrix[x, 3:5] <- cbind(colnames(W)[ind[x, "col"]],
+                                colnames(W)[ind[x, "row"]],
+                                round(W[colnames(W)[ind[x, "col"]],
+                                        colnames(W)[ind[x, "row"]]],5))
+  }
+  colnames(snf_matrix)[3:5] <- c("Source", "Target", "Weight")
+  snf_matrix$name <- paste(as.character(snf_matrix$Source), 
+                           as.character(snf_matrix$Target), sep = ".")
+  
+  # threshold the similarity network
+  snf_matrix_thr <- as.data.frame(matrix(0, 0, 6))
+  for (i in 1:dim(W)[1]) {
+    tmp_weight <- snf_matrix[snf_matrix$col == i, ]
+    top <- tmp_weight[as.numeric(tmp_weight$Weight) > quantile(as.numeric(tmp_weight$Weight), prob = 1 - 15/100),]
+    snf_matrix_thr <- rbind(top, snf_matrix_thr)
+  }
+  
+  dim(snf_matrix_thr)
+  
+  # thresholded matrix
+  
+  matrix_thr <- as.data.frame(matrix(0, nrow(dat), nrow(dat)))
+  rownames(matrix_thr) <- dat$subj
+  colnames(matrix_thr) <- dat$subj
+  
+  for (i in seq_along(snf_matrix_thr$Source)) {
+    matrix_thr[snf_matrix_thr$Source[i], snf_matrix_thr$Target[i]] <- 
+      as.numeric(snf_matrix_thr$Weight[i])
+  }
+  
+  #browser()
+  # Louvain clustering analysis
+  gg <- as.matrix(matrix_thr)
+  G1 <- graph_from_adjacency_matrix(gg, mode = "undirected", weighted = TRUE, 
+                                    diag = FALSE)
+  
+  clusterlouvain <- igraph::cluster_louvain(G1)
+  nclust <- max(clusterlouvain$membership)
+  
+  print(paste0("There are ",  nclust, " clusters")) 
+  
+  # clustering results
+  W_Clustering_thr <- as.data.frame(matrix(0, dim(W)[1], 3))
+  colnames(W_Clustering_thr) <- c("subj", "Clustering", "group")
+  
+  W_Clustering_thr$Clustering <- clusterlouvain$membership
+  W_Clustering_thr$subj <- dat$subj
+  W_Clustering_thr$group <- dat$group
+  #browser()
+  
+  return(W_Clustering_thr)
+}
+```
+
+
+
+##Clustering 
+```{r NMI calculation for repeated random subsampeled data based on SNF_Luv clustering}
+ROI_var <- 
+  colnames(yaqoing.input.data)[c(5:8)]
+clinic_var <- 
+  colnames(yaqoing.input.data)[c(9:14)]
+
+
+Total.No.Of.Subjects <- 
+  nrow(yaqoing.input.data)
+subSampleRatioVctr <- 
+  c(0.95, 0.9, 0.8, 0.7, 0.6, 0.5)
+#initialzing the final df that will be using for viz
+NMI.values.final.df.4.Viz <- 
+  matrix(data = NA, nrow = 1, ncol = 3)
+NMI.values.final.df.4.Viz <- 
+  as.data.frame(NMI.values.final.df.4.Viz)
+colnames(NMI.values.final.df.4.Viz) <- 
+  c("NMI.Value", "PCNT", "ClusteringType")
+maxIter <- 
+  100 
+for (current.pcnt in subSampleRatioVctr) 
+{
+  #for each pcnt random subsetting/clsutering will be done "maxIter" times
+    for (i in c(1:maxIter)) 
+   {
+    #selecting a random subset of the data 
+    #"Total.No.Of.Subjects* current.pcnt" is the number of subjects in the random subsampled data set
+    rnd.row.names <- 
+    sample(x = rownames(yaqoing.input.data), 
+           size = Total.No.Of.Subjects*current.pcnt, 
+           replace = FALSE)
+  yaqoing.input.data.subsempled.data <- 
+    yaqoing.input.data[rnd.row.names,]
+  #extracting the original clsutering labels for the rnd subset
+  original.cluster.labels <- 
+    yaqoing.input.data[rnd.row.names,]$Clustering
+  
+  #clustering the random subset of the data
+  yaqoing.input.data.subsempled.data.Clustering.Res <- SNF_Louvain.Simple.Output(dat = yaqoing.input.data.subsempled.data, 
+              ROI_var = ROI_var, clinic_var = clinic_var)
+  #extracting the new clsutering labels for the rnd subset
+  subsempled.data.Clusterlabels <- yaqoing.input.data.subsempled.data.Clustering.Res$Clustering
+  
+ current.NMI <- calNMI(original.cluster.labels, 
+         subsempled.data.Clusterlabels)
+ 
+ #the ("current.NMI","current.pcnt", "SNF_Louvain") will be added to the final df for visualiztion 
+ new.row.2.b.added <- 
+   cbind(NMI.Value = current.NMI, 
+         PCNT = as.character(current.pcnt), 
+         ClusteringType = "SNF_Louvain")
+ NMI.values.final.df.4.Viz <-
+   rbind(NMI.values.final.df.4.Viz, new.row.2.b.added)
+ 
+ }
+  message(paste("Finished for", as.character(current.pcnt)))
+}
+
+
+
+```
+
+```{r NMI calculation for repeated random subsampeled data based on RND clustering}
+
+#the follwoing four variables have beed defined in the prev chunk
+# "Total.No.Of.Subjects" 
+# "subSampleRatioVctr"
+# "NMI.values.final.df.4.Viz" 
+# "maxIter" 
+
+for (current.pcnt in subSampleRatioVctr) 
+{
+  #for each pcnt random subsetting/clsutering will be done "maxIter" times
+    for (i in c(1:maxIter)) 
+   {
+    #selecting a random subset of the data 
+    #"Total.No.Of.Subjects* current.pcnt" is the number of subjects in the random subsampled data set
+    rnd.row.names <- 
+    sample(x = rownames(yaqoing.input.data), 
+           size = Total.No.Of.Subjects*current.pcnt, 
+           replace = FALSE)
+  yaqoing.input.data.subsempled.data <- 
+    yaqoing.input.data[rnd.row.names,]
+  #extracting the original clsutering labels for the rnd subset
+  original.cluster.labels <- 
+    yaqoing.input.data[rnd.row.names,]$Clustering
+
+    #oermuting the labels (using random sampling with the same size)
+  permuted.cluster.labels <- sample(x = original.cluster.labels, size = length(original.cluster.labels), replace = FALSE)
+  current.NMI <- 
+    calNMI(original.cluster.labels, permuted.cluster.labels)
+ 
+ #the ("current.NMI","current.pcnt", "RND") will be added to the final df for visualiztion 
+ new.row.2.b.added <- 
+   cbind(NMI.Value = current.NMI, 
+         PCNT = as.character(current.pcnt), 
+         ClusteringType = "RND")
+ NMI.values.final.df.4.Viz <-
+   rbind(NMI.values.final.df.4.Viz, new.row.2.b.added)
+ }
+  message(paste("Finished NMI calculation for RND clustering", as.character(current.pcnt)))
+}
+
+
+
+```
+
+
+```{r Viz}
+str(NMI.values.final.df.4.Viz)
+#backing up the final df 
+temp <- 
+  NMI.values.final.df.4.Viz
+#removing the first row (it's NA)
+NMI.values.final.df.4.Viz <- 
+  NMI.values.final.df.4.Viz[-1,]
+#dim(NMI.values.final.df.4.Viz)
+
+#changing data type of the cols
+NMI.values.final.df.4.Viz$NMI.Value <-
+  as.numeric(NMI.values.final.df.4.Viz$NMI.Value)
+
+p <- 
+  NMI.values.final.df.4.Viz %>%
+    ggplot(aes(x = PCNT, y = NMI.Value, fill = PCNT)) + 
+    facet_grid(ClusteringType~.)
+
+p + geom_boxplot()
+p + geom_violin()
+
+q <- 
+  NMI.values.final.df.4.Viz %>%
+    ggplot(aes(x = PCNT, y = NMI.Value,  fill = ClusteringType)) 
+q + geom_violin()
+q + geom_boxplot()
+#adding a new cols for ggbetweenstats
+#this new col is a concatenation of tow cols that will be used as a new var to be used as "x" 
+NMI.values.final.df.4.Viz <- 
+  NMI.values.final.df.4.Viz %>% 
+    mutate(PCNT.ClsuetringType = paste(PCNT, ClusteringType))
+
+pdf("/Users/apple/Desktop/Eric/Research/FunctionalGenomics/Manuscript Drafts /Other Colab/YaqoingPaper/Yaqoing.Paper.RevR.Proj/Viz/Robustness.100.Iter.NMI.ggbetweenstats.V3.pdf", width = 15)
+NMI.values.final.df.4.Viz %>%
+  ggbetweenstats(
+    x     = PCNT.ClsuetringType,
+    y     = NMI.Value,
+    fill = ClusteringType,
+    pairwise.comparisons = FALSE,
+    centrality.type = "parameteric",
+    palette = "Set3"
+    #ggplot.component = ggplot2::scale_color_manual(values=c("red","green"))) 
+  ) 
+dev.off()
+
+```
+
