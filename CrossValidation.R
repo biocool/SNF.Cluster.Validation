@@ -5,8 +5,6 @@ ROI_var <-
   colnames(yaqoing.input.data.intake)[c(5:8)]
 clinic_var <- 
   colnames(yaqoing.input.data.intake)[c(9:14)]
-
-
 # normalization variables for each yaqoing.input.data.intakea type
 
 ROI_yaqoing.input.data.intake <- standardNormalization(yaqoing.input.data.intake[,ROI_var])
@@ -78,8 +76,6 @@ SNF.repeated.cross.validation <-
 
 SNF.cross.validation <- function(fold.No, layers.list , cluster.index.vctr)
 {
-  
-
   flds <- createFolds( c(1:length(yaqoing.data.cluster.index.vctr)), 
                        k = fold.No, list = TRUE, returnTrain = FALSE)
   accuracy.vctr <- c()
